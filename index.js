@@ -21,7 +21,9 @@ const io = require("socket.io")(http, {
 // Configuration
 const CONFIG = {
   port: process.env.PORT || 3000,
-  apiUrl: "https://openrouter.ai/api/v1/chat/completions",
+  // Configurable so this same code works with OpenRouter, NordRouter, or any other
+  // OpenAI-compatible chat-completions endpoint -- set API_BASE_URL in .env.
+  apiUrl: (process.env.API_BASE_URL || "https://openrouter.ai/api/v1") + "/chat/completions",
   maxRetries: 3,
   timeout: 30000,
   maxMessageLength: 1000,
