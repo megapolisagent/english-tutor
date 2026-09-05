@@ -7,6 +7,8 @@ const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 const compression = require("compression");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 const app = express();
 const http = require("http").createServer(app);
 const io = require("socket.io")(http, {
@@ -26,6 +28,110 @@ const CONFIG = {
   rateLimitWindow: 15 * 60 * 1000, // 15 minutes
   rateLimitMax: 100 // requests per window
 };
+
+// ==== Family tutor contract: memory + Telegram (deterministic, not model-dependent) ====
+
+const MEMORY_DIR = path.join(__dirname, "memory");
+const AGENTS_MD_PATH = path.join(__dirname, "AGENTS.md");
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+
+function readFileSafe(p, fallback = "") {
+  try {
+    return fs.readFileSync(p, "utf8");
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function loadMemoryContext() {
+  const competencyMap = readFileSafe(path.join(MEMORY_DIR, "competency_map.md"));
+  const studentProfile = readFileSafe(path.join(MEMORY_DIR, "student_profile.md"));
+  const sessionState = readFileSafe(path.join(MEMORY_DIR, "session_state.md"));
+  const lessonHistory = readFileSafe(path.join(MEMORY_DIR, "lesson_history.md"));
+  return `--- memory/competency_map.md ---\n${competencyMap}\n\n--- memory/student_profile.md ---\n${studentProfile}\n\n--- memory/session_state.md ---\n${sessionState}\n\n--- memory/lesson_history.md (последние записи) ---\n${lessonHistory}`;
+}
+
+function buildSystemPrompt() {
+  const agentsMd = readFileSafe(AGENTS_MD_PATH, "You are an English tutor for a Russian-speaking 8th grader.");
+  const memoryContext = loadMemoryContext();
+  return `${agentsMd}\n\n=== ТЕКУЩАЯ ПАМЯТЬ ОБ ЭТОМ УЧЕНИКЕ ===\n${memoryContext}`;
+}
+
+// Extract a ```memory_update ... ``` fenced JSON block from the model's reply.
+// Returns { cleanText, update } -- update is null if no valid block was found.
+function extractMemoryUpdate(reply) {
+  const match = reply.match(/```memory_update\s*([\s\S]*?)```/);
+  if (!match) return { cleanText: reply, update: null };
+  const cleanText = reply.replace(match[0], "").trim();
+  try {
+    const update = JSON.parse(match[1].trim());
+    return { cleanText, update };
+  } catch (e) {
+    console.error("⚠️ memory_update block was not valid JSON:", e.message);
+    return { cleanText, update: null };
+  }
+}
+
+// Apply a parsed memory update deterministically -- the model only supplies facts,
+// the server owns the file format, same principle as the Data Contract used elsewhere
+// in this family's agents (structured schema in, code writes the file, not the model).
+function applyMemoryUpdate(update) {
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10);
+
+  if (Array.isArray(update.competency_updates) && update.competency_updates.length > 0) {
+    const mapPath = path.join(MEMORY_DIR, "competency_map.md");
+    let content = readFileSafe(mapPath, "# Competency Map\n\n| Тема | Статус | Последняя проверка | Заметки |\n|---|---|---|---|\n");
+    const lines = content.split("\n");
+    const headerIdx = lines.findIndex((l) => l.trim().startsWith("|---"));
+    for (const u of update.competency_updates) {
+      if (!u || !u.topic) continue;
+      const rowText = `| ${u.topic} | ${u.status || "не проверена"} | ${dateStr} | ${(u.notes || "").replace(/\|/g, "/")} |`;
+      const existingIdx = lines.findIndex((l) => l.startsWith(`| ${u.topic} `) || l.startsWith(`| ${u.topic}|`));
+      if (existingIdx !== -1) {
+        lines[existingIdx] = rowText;
+      } else {
+        lines.splice(headerIdx + 1, 0, rowText);
+      }
+    }
+    fs.writeFileSync(mapPath, lines.join("\n"), "utf8");
+  }
+
+  if (update.next_lesson_plan) {
+    const profilePath = path.join(MEMORY_DIR, "student_profile.md");
+    let content = readFileSafe(profilePath);
+    if (content.includes("## Next Lesson Plan")) {
+      content = content.replace(/## Next Lesson Plan[\s\S]*$/, `## Next Lesson Plan\n- ${update.next_lesson_plan}\n`);
+    } else {
+      content += `\n\n## Next Lesson Plan\n- ${update.next_lesson_plan}\n`;
+    }
+    fs.writeFileSync(profilePath, content, "utf8");
+  }
+
+  if (update.session_summary) {
+    const historyPath = path.join(MEMORY_DIR, "lesson_history.md");
+    const entry = `\n## ${dateStr}\n${update.session_summary}\n`;
+    fs.appendFileSync(historyPath, entry, "utf8");
+  }
+}
+
+async function sendTelegram(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.warn("⚠️ Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID) -- skipping notification");
+    return;
+  }
+  try {
+    await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      chat_id: TELEGRAM_CHAT_ID,
+      text,
+    });
+  } catch (e) {
+    console.error("⚠️ Telegram notification failed:", e.message);
+  }
+}
+
+// ==== end family tutor contract additions ====
 
 // Personality system prompts - Enhanced for English Learning
 const PERSONALITY_PROMPTS = {
@@ -181,7 +287,9 @@ io.on("connection", (socket) => {
     userAgent: socket.handshake.headers['user-agent'],
     connectedAt: new Date().toISOString(),
     messageCount: 0,
-    lastActivity: new Date()
+    lastActivity: new Date(),
+    history: [], // {role, content} turns for this session, so the model has real context
+    sessionStartedAt: null // set on first real chat message, used for the Telegram report
   };
   
   connections.set(socket.id, clientInfo);
@@ -238,20 +346,32 @@ io.on("connection", (socket) => {
         throw new Error(`Message too long. Maximum ${CONFIG.maxMessageLength} characters allowed.`);
       }
 
-      console.log(`🗣️ [${socket.id}] User said: "${text}" (Mode: ${learningMode}, Level: ${difficultyLevel})`);
+      console.log(`🗣️ [${socket.id}] User said: "${text}"`);
 
-      // Analyze speech for learning feedback
+      // First real message of this connection -- session has begun, notify owner.
+      if (client && !client.sessionStartedAt) {
+        client.sessionStartedAt = new Date();
+        sendTelegram(`Начал заниматься (английский): ${client.sessionStartedAt.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`);
+      }
+
+      // Analyze speech for learning feedback (kept -- feeds the grammar/pronunciation
+      // heuristics already implemented below, useful signal for the model too)
       const speechAnalysis = await analyzeSpeechForLearning(text, difficultyLevel, learningMode);
 
-      // Get enhanced personality prompt with learning context
-      const systemPrompt = getEnhancedTutorPrompt(personality, difficultyLevel, feedbackStyle, speechAnalysis);
+      // Our own contract + this student's real memory replaces the personality dropdown.
+      const systemPrompt = buildSystemPrompt();
 
-      // Prepare API request with learning context
+      if (client) {
+        client.history.push({ role: "user", content: text });
+      }
+
+      // Prepare API request with real conversation history, not just this one message --
+      // the original app sent every turn in isolation, which breaks multi-step teaching.
       const apiRequest = {
         model: model,
-          messages: [
+        messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: `Student said: "${text}"\n\nSpeech Analysis: ${JSON.stringify(speechAnalysis)}\n\nPlease provide appropriate feedback and continue the conversation.` }
+          ...(client ? client.history : [{ role: "user", content: text }]),
         ],
         max_tokens: 600,
         temperature: 0.7,
@@ -260,12 +380,22 @@ io.on("connection", (socket) => {
 
       // Make API call with retry logic
       const response = await makeAPICallWithRetry(apiRequest, CONFIG.maxRetries);
-      
+
       if (!response || !response.data || !response.data.choices || !response.data.choices[0]) {
         throw new Error('Invalid API response format');
       }
 
-      const reply = response.data.choices[0].message.content;
+      const rawReply = response.data.choices[0].message.content;
+      const { cleanText: reply, update } = extractMemoryUpdate(rawReply);
+      if (update) {
+        applyMemoryUpdate(update);
+        console.log(`💾 [${socket.id}] Memory update applied:`, JSON.stringify(update).slice(0, 200));
+      }
+
+      if (client) {
+        client.history.push({ role: "assistant", content: reply });
+      }
+
       const processingTime = Date.now() - startTime;
 
       console.log(`🤖 [${socket.id}] Tutor reply (${processingTime}ms): "${reply}"`);
@@ -278,7 +408,6 @@ io.on("connection", (socket) => {
         metadata: {
           processingTime,
           model: model,
-          personality: personality,
           learningMode: learningMode,
           difficultyLevel: difficultyLevel,
           timestamp: new Date().toISOString()
@@ -330,6 +459,14 @@ io.on("connection", (socket) => {
     if (client) {
       const sessionDuration = Date.now() - new Date(client.connectedAt).getTime();
       console.log(`❌ Client disconnected: ${socket.id} (Reason: ${reason}, Duration: ${Math.round(sessionDuration/1000)}s, Messages: ${client.messageCount})`);
+
+      if (client.sessionStartedAt) {
+        const endedAt = new Date();
+        const minutes = Math.max(0, Math.round((endedAt - client.sessionStartedAt) / 60000));
+        const fmt = (d) => d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+        sendTelegram(`Закончил (английский): ${fmt(client.sessionStartedAt)}-${fmt(endedAt)} (${minutes} мин)`);
+      }
+
       connections.delete(socket.id);
     }
     
