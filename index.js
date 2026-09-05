@@ -323,7 +323,7 @@ io.on("connection", (socket) => {
       if (typeof data === 'string') {
         // Old format - just text
         text = data;
-        model = 'openai/gpt-3.5-turbo';
+        model = 'moonshotai/kimi-k2.5';
         personality = 'conversation_partner';
         learningMode = 'conversation';
         difficultyLevel = 'intermediate';
@@ -331,7 +331,7 @@ io.on("connection", (socket) => {
       } else if (typeof data === 'object' && data !== null) {
         // New format - object with learning parameters
         text = data.text;
-        model = data.model || 'openai/gpt-3.5-turbo';
+        model = data.model || 'moonshotai/kimi-k2.5';
         personality = data.personality || 'conversation_partner';
         learningMode = data.learningMode || 'conversation';
         difficultyLevel = data.difficultyLevel || 'intermediate';
