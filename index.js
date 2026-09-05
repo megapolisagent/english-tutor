@@ -377,7 +377,10 @@ io.on("connection", (socket) => {
         ],
         max_tokens: 600,
         temperature: 0.7,
-        stream: false
+        stream: false,
+        enable_thinking: false // matches the math tutor's setting; empirically didn't
+        // change latency in testing (5-20s either way for this prompt size on
+        // NordRouter/Kimi K2.5), but kept for consistency and in case it helps sometimes.
       };
 
       // Make API call with retry logic
